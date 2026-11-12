@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0B4A80">
+<title>שיחות</title>
+<style>
+:root{--navy:#0B4A80;--sky:#2F8DB8;--bg:#F5F8FA;--card:#fff;--text:#14283C;--muted:#5E7184;--line:#D9E2EA;--ok:#1E7D4F;--bad:#B3261E;--note:#FFF6DB}
+@media (prefers-color-scheme:dark){:root{--navy:#9CC3EA;--sky:#4FA9D3;--bg:#0F1923;--card:#16222E;--text:#E4ECF3;--muted:#9AAEC0;--line:#2A3A4A;--ok:#5CC28E;--bad:#F08A80;--note:#2E2A1C}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:17px/1.5 Arial,sans-serif;padding:16px 16px calc(24px + env(safe-area-inset-bottom))}
+h1{font-size:22px;margin:0 0 12px;color:var(--navy)}
+.btn{display:block;width:100%;border:0;border-radius:14px;padding:16px;font-size:20px;font-weight:700;background:var(--sky);color:#fff;text-align:center;text-decoration:none;margin:10px 0}
+.btn.sec{background:var(--card);color:var(--navy);border:1px solid var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:10px 0}
+.name{font-size:20px;font-weight:700}
+.pts{background:var(--note);border-radius:10px;padding:10px;margin:8px 0;font-size:18px;white-space:pre-wrap}
+.muted{color:var(--muted);font-size:15px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+#log{font-size:14px;color:var(--muted);white-space:pre-wrap;margin-top:16px}
+</style>
+</head>
+<body>
+<h1>שיחות · עמוד ניסיון</h1>
+<div id="app"><p class="muted">טוען…</p></div>
+<div id="log"></div>
+<script>
+// Phone app probe. Talks to Microsoft To Do (Graph) for a personal Microsoft account only.
+// No data is stored in this code or in the repository: everything lives in the user's To Do.
+const CLIENT_ID = "5353ab82-7429-41f9-aa9a-11c30b734e65";
+const AUTH = "https://login.microsoftonline.com/consumers/oauth2/v2.0";
+const SCOPES = "Tasks.ReadWrite offline_access openid";
+const REDIRECT = location.origin + location.pathname;
+const LIST_NAME = "שיחות";
+const $ = s => document.querySelector(s);
+const log = m => { $("#log").textContent += m + "\n"; };
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem("pd_" + k)); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem("pd_" + k, JSON.stringify(v)); } catch {} },
+  del(k) { try { localStorage.removeItem("pd_" + k); } catch {} }
+};
+
+// ---------- sign-in: authorization code + PKCE, no library ----------
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const randomStr = n => b64url(crypto.getRandomValues(new Uint8Array(n)));
+async function login(silent) {
+  const verifier = randomStr(48), state = randomStr(16);
+  const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  sessionStorage.setItem("pd_pkce", JSON.stringify({ verifier, state, silent: !!silent }));
+  const q = new URLSearchParams({ client_id: CLIENT_ID, response_type: "code", redirect_uri: REDIRECT, scope: SCOPES,
+    code_challenge: challenge, code_challenge_method: "S256", state, response_mode: "query" });
+  if (silent) q.set("prompt", "none");
+  location.assign(AUTH + "/authorize?" + q);
+}
+async function tokenRequest(params) {
+  const r = await fetch(AUTH + "/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: REDIRECT, scope: SCOPES, ...params }) });
+  const j = await r.json();
+  if (!r.ok) throw Object.assign(new Error(j.error_description || j.error || "token error"), { code: j.error });
+  store.set("tok", { at: j.access_token, rt: j.refresh_token, exp: Date.now() + (j.expires_in - 120) * 1000 });
+  return j.access_token;
+}
+async function handleRedirect() {
+  const p = new URLSearchParams(location.search);
+  if (!p.has("code") && !p.has("error")) return false;
+  const saved = JSON.parse(sessionStorage.getItem("pd_pkce") || "{}");
+  sessionStorage.removeItem("pd_pkce");
+  history.replaceState(null, "", REDIRECT);
+  if (p.get("error")) {
+    if (saved.silent) { log("כניסה שקטה לא הצליחה: " + p.get("error")); return "needLogin"; }
+    throw new Error(p.get("error_description") || p.get("error"));
+  }
+  if (p.get("state") !== saved.state) throw new Error("state mismatch");
+  await tokenRequest({ grant_type: "authorization_code", code: p.get("code"), code_verifier: saved.verifier });
+  return true;
+}
+async function token() {
+  const t = store.get("tok");
+  if (t && t.at && Date.now() < t.exp) return t.at;
+  if (t && t.rt) {
+    try { return await tokenRequest({ grant_type: "refresh_token", refresh_token: t.rt }); }
+    catch (e) { log("רענון נכשל: " + e.message); }
+  }
+  return null;
+}
+async function graph(path, opts = {}) {
+  const at = await token();
+  if (!at) throw Object.assign(new Error("not signed in"), { code: "login" });
+  const r = await fetch("https://graph.microsoft.com/v1.0" + path, { ...opts,
+    headers: { Authorization: "Bearer " + at, "Content-Type": "application/json", ...(opts.headers || {}) } });
+  if (r.status === 204) return null;
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j.error && j.error.message) || ("HTTP " + r.status));
+  return j;
+}
+
+// ---------- calls ----------
+// Task titles from the dashboard sync look like "name · phone · what to say".
+function parseCall(t) {
+  const parts = (t.title || "").split(" · ");
+  const body = (t.body && t.body.content) || "";
+  const phone = (parts.find(s => /^[+\d][\d\s\-()]{6,}$/.test(s.trim())) || (body.match(/\+?\d[\d\s\-]{7,}\d/) || [""])[0]).trim();
+  const name = parts[0] || "";
+  const points = parts.filter(s => s !== parts[0] && s.trim() !== phone).join("\n").replace(/ \/ /g, "\n");
+  return { id: t.id, name, phone, points };
+}
+const telHref = p => "tel:" + p.replace(/[^\d+]/g, "");
+
+async function load() {
+  const lists = await graph("/me/todo/lists");
+  const list = (lists.value || []).find(l => l.displayName === LIST_NAME);
+  if (!list) { $("#app").innerHTML = `<p class="bad">לא נמצאה רשימה בשם "${esc(LIST_NAME)}" ב־To Do.</p><p class="muted">רשימות שנמצאו: ${esc((lists.value || []).map(l => l.displayName).join(", "))}</p>`; return; }
+  const tasks = await graph(`/me/todo/lists/${list.id}/tasks?$filter=status ne 'completed'&$top=50`);
+  const calls = (tasks.value || []).map(parseCall);
+  $("#app").innerHTML = `<p class="ok">מחובר. נמצאו ${calls.length} שיחות פתוחות.</p>
+    <button class="btn sec" id="wtest">בדיקת כתיבה ל־To Do</button><p id="wres" class="muted"></p>
+    ${calls.map(c => `<div class="card"><div class="name">${esc(c.name)}</div>
+      ${c.points ? `<div class="pts">${esc(c.points)}</div>` : ""}
+      ${c.phone ? `<a class="btn" href="${esc(telHref(c.phone))}">חיוג · ${esc(c.phone)}</a>` : `<p class="muted">אין מספר טלפון</p>`}</div>`).join("")}`;
+  $("#wtest").onclick = async () => {
+    $("#wres").textContent = "בודק…";
+    try {
+      const t = await graph(`/me/todo/lists/${list.id}/tasks`, { method: "POST", body: JSON.stringify({ title: "בדיקת כתיבה מהאפליקציה (נמחקת מיד)" }) });
+      await graph(`/me/todo/lists/${list.id}/tasks/${t.id}`, { method: "DELETE" });
+      $("#wres").innerHTML = `<span class="ok">הכתיבה עובדת: נוצרה משימה ונמחקה.</span>`;
+    } catch (e) { $("#wres").innerHTML = `<span class="bad">הכתיבה נכשלה: ${esc(e.message)}</span>`; }
+  };
+}
+function showLogin(msg) {
+  $("#app").innerHTML = `${msg ? `<p class="muted">${esc(msg)}</p>` : ""}<button class="btn" id="li">כניסה עם החשבון של To Do</button>
+    <p class="muted">להתחבר עם החשבון האישי (ganzelu@gmail.com), זה שמחובר ל־To Do.</p>`;
+  $("#li").onclick = () => login(false);
+}
+(async () => {
+  try {
+    const r = await handleRedirect();
+    if (r === "needLogin") return showLogin("צריך להתחבר שוב.");
+    if (!(await token())) {
+      if (store.get("tok")) return login(true); // had a session: try a silent redirect first
+      return showLogin();
+    }
+    await load();
+  } catch (e) {
+    if (e.code === "login") return showLogin();
+    $("#app").innerHTML = `<p class="bad">תקלה: ${esc(e.message)}</p><button class="btn sec" onclick="location.reload()">נסה שוב</button>`;
+  }
+})();
+</script>
+</body>
+</html>
